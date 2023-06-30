@@ -2,6 +2,9 @@ package triggers
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
@@ -27,14 +30,15 @@ import (
 )
 
 type k8sInformers struct {
-	podInformers          []coreinformerv1.PodInformer
-	deploymentInformers   []appsinformerv1.DeploymentInformer
-	daemonsetInformers    []appsinformerv1.DaemonSetInformer
-	statefulsetInformers  []appsinformerv1.StatefulSetInformer
-	serviceInformers      []coreinformerv1.ServiceInformer
-	ingressInformers      []networkinginformerv1.IngressInformer
-	clusterEventInformers []coreinformerv1.EventInformer
-	configMapInformers    []coreinformerv1.ConfigMapInformer
+	customResourceInformers []informers.GenericInformer
+	podInformers            []coreinformerv1.PodInformer
+	deploymentInformers     []appsinformerv1.DeploymentInformer
+	daemonsetInformers      []appsinformerv1.DaemonSetInformer
+	statefulsetInformers    []appsinformerv1.StatefulSetInformer
+	serviceInformers        []coreinformerv1.ServiceInformer
+	ingressInformers        []networkinginformerv1.IngressInformer
+	clusterEventInformers   []coreinformerv1.EventInformer
+	configMapInformers      []coreinformerv1.ConfigMapInformer
 
 	testTriggerInformer testkubeinformerv1.TestTriggerInformer
 	testSuiteInformer   testkubeinformerv3.TestSuiteInformer
@@ -140,7 +144,7 @@ func (s *Service) runInformers(ctx context.Context, stop <-chan struct{}) {
 		s.informers.configMapInformers[i].Informer().AddEventHandler(s.configMapEventHandler(ctx))
 	}
 
-	s.informers.testTriggerInformer.Informer().AddEventHandler(s.testTriggerEventHandler())
+	s.informers.testTriggerInformer.Informer().AddEventHandler(s.testTriggerEventHandler(ctx, stop))
 	s.informers.testSuiteInformer.Informer().AddEventHandler(s.testSuiteEventHandler())
 	s.informers.testInformer.Informer().AddEventHandler(s.testEventHandler())
 
@@ -608,7 +612,7 @@ func (s *Service) clusterEventEventHandler(ctx context.Context) cache.ResourceEv
 	}
 }
 
-func (s *Service) testTriggerEventHandler() cache.ResourceEventHandlerFuncs {
+func (s *Service) testTriggerEventHandler(ctx context.Context, stop <-chan struct{}) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			t, ok := obj.(*testtriggersv1.TestTrigger)
@@ -621,6 +625,23 @@ func (s *Service) testTriggerEventHandler() cache.ResourceEventHandlerFuncs {
 				t.Namespace, t.Name, t.Spec.Resource, t.Spec.Event,
 			)
 			s.addTrigger(t)
+
+			df := dynamicinformer.NewFilteredDynamicSharedInformerFactory(s.dynamicClientset, 0, v1.NamespaceAll, nil)
+
+			//gvr := schema.GroupVersionResource{
+			//	Group:    "helm.toolkit.fluxcd.io",
+			//	Version:  "v2beta1",
+			//	Resource: "helmreleases",
+			//}
+			gvr := schema.GroupVersionResource{
+				Group:    t.Spec.CustomResource.Group,
+				Version:  t.Spec.CustomResource.Version,
+				Resource: t.Spec.CustomResource.Resource,
+			}
+			customResourceInformer := df.ForResource(gvr)
+			customResourceInformer.Informer().AddEventHandler(s.customResourceEventHandler(ctx, gvr))
+			s.logger.Debugf("trigger service: starting custom resource informers")
+			go customResourceInformer.Informer().Run(stop)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			t, ok := newObj.(*testtriggersv1.TestTrigger)
@@ -648,6 +669,80 @@ func (s *Service) testTriggerEventHandler() cache.ResourceEventHandlerFuncs {
 				t.Namespace, t.Name, t.Spec.Resource, t.Spec.Event,
 			)
 			s.removeTrigger(t)
+		},
+	}
+}
+
+func (s *Service) customResourceEventHandler(ctx context.Context, gvr schema.GroupVersionResource) cache.ResourceEventHandlerFuncs {
+	getConditions := func(object metav1.Object) func() ([]testtriggersv1.TestTriggerCondition, error) {
+		return func() ([]testtriggersv1.TestTriggerCondition, error) {
+			return getCustomResourceConditions(ctx, s.dynamicClientset, object, gvr)
+		}
+	}
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			customResource, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				s.logger.Errorf("failed to process create customResource event due to it being an unexpected type, received type %+v", obj)
+				return
+			}
+			if inPast(customResource.GetCreationTimestamp().Time, s.watchFromDate) {
+				s.logger.Debugf(
+					"trigger customResource: watcher component: no-op create trigger: customResource %s/%s was created in the past",
+					customResource.GetNamespace(), customResource.GetName(),
+				)
+				return
+			}
+			s.logger.Debugf("trigger customResource: watcher component: emiting event: customResource %s/%s created", customResource.GetNamespace(), customResource.GetName())
+			// TODO: testtrigger.ResourceService -> testtrigger.ResourceCustomResource
+			event := newWatcherEvent(testtrigger.EventCreated, customResource, testtrigger.ResourceCustomResource, withConditionsGetter(getConditions(customResource)))
+			if err := s.match(ctx, event); err != nil {
+				s.logger.Errorf("event matcher returned an error while matching create customResource event: %v", err)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldCustomResource, ok := oldObj.(*unstructured.Unstructured)
+			if !ok {
+				s.logger.Errorf(
+					"failed to process update service event for old object due to it being an unexpected type, received type %+v",
+					oldCustomResource,
+				)
+				return
+			}
+			newCustomResource, ok := newObj.(*unstructured.Unstructured)
+			if !ok {
+				s.logger.Errorf(
+					"failed to process update service event for new object due to it being an unexpected type, received type %+v",
+					newCustomResource,
+				)
+				return
+			}
+
+			if newCustomResource.GetGeneration() == newCustomResource.GetGeneration() {
+				s.logger.Debugf("trigger service: watcher component: no-op update trigger: service specs are equal")
+			}
+			s.logger.Debugf(
+				"trigger service: watcher component: emiting event: service %s/%s updated",
+				newCustomResource.GetNamespace(), newCustomResource.GetName(),
+			)
+			// TODO: testtrigger.ResourceService -> testtrigger.ResourceCustomResource
+			event := newWatcherEvent(testtrigger.EventModified, newCustomResource, testtrigger.ResourceCustomResource, withConditionsGetter(getConditions(newCustomResource)))
+			if err := s.match(ctx, event); err != nil {
+				s.logger.Errorf("event matcher returned an error while matching update service event: %v", err)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			customResource, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				s.logger.Errorf("failed to process delete customResource event due to it being an unexpected type, received type %+v", obj)
+				return
+			}
+			s.logger.Debugf("trigger service: watcher component: emiting event: customResource %s/%s deleted", customResource.GetNamespace(), customResource.GetName())
+			// TODO: testtrigger.ResourceService -> testtrigger.ResourceCustomResource
+			event := newWatcherEvent(testtrigger.EventDeleted, customResource, testtrigger.ResourceCustomResource, withConditionsGetter(getConditions(customResource)))
+			if err := s.match(ctx, event); err != nil {
+				s.logger.Errorf("event matcher returned an error while matching delete customResource event: %v", err)
+			}
 		},
 	}
 }
