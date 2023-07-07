@@ -2,18 +2,15 @@ package triggers
 
 import (
 	"context"
+	"fmt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/dynamicinformer"
-
-	"github.com/google/go-cmp/cmp"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/informers"
 	appsinformerv1 "k8s.io/client-go/informers/apps/v1"
+	"time"
+
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coreinformerv1 "k8s.io/client-go/informers/core/v1"
 	networkinginformerv1 "k8s.io/client-go/informers/networking/v1"
 	"k8s.io/client-go/kubernetes"
@@ -22,14 +19,25 @@ import (
 	testkubeinformerv1 "github.com/kubeshop/testkube-operator/pkg/informers/externalversions/tests/v1"
 	testkubeinformerv3 "github.com/kubeshop/testkube-operator/pkg/informers/externalversions/tests/v3"
 
+	networkingv1 "k8s.io/api/networking/v1"
+
+	"github.com/google/go-cmp/cmp"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 
 	testsv3 "github.com/kubeshop/testkube-operator/apis/tests/v3"
-	testsuitev3 "github.com/kubeshop/testkube-operator/apis/testsuite/v3"
+	testsuitev2 "github.com/kubeshop/testkube-operator/apis/testsuite/v2"
 	testtriggersv1 "github.com/kubeshop/testkube-operator/apis/testtriggers/v1"
 	"github.com/kubeshop/testkube-operator/pkg/informers/externalversions"
 	"github.com/kubeshop/testkube-operator/pkg/validation/tests/v1/testtrigger"
 )
+
+type InformersData struct {
+	informer *informers.GenericInformer
+	cancel   context.CancelFunc
+}
 
 type k8sInformers struct {
 	customResourceInformers []informers.GenericInformer
@@ -42,19 +50,21 @@ type k8sInformers struct {
 	clusterEventInformers   []coreinformerv1.EventInformer
 	configMapInformers      []coreinformerv1.ConfigMapInformer
 
-	testTriggerInformer testkubeinformerv1.TestTriggerInformer
-	testSuiteInformer   testkubeinformerv3.TestSuiteInformer
-	testInformer        testkubeinformerv3.TestInformer
+	testTriggerInformers []testkubeinformerv1.TestTriggerInformer
+	testSuiteInformers   []testkubeinformerv3.TestSuiteInformer
+	testInformers        []testkubeinformerv3.TestInformer
+	triggerCRInformers   map[string]*InformersData
+	crInformers          map[string]*InformersData
 }
 
-func newK8sInformers(clientset kubernetes.Interface, testKubeClientset versioned.Interface,
-	testkubeNamespace string, watcherNamespaces []string) *k8sInformers {
+func newK8sInformers(clientset kubernetes.Interface, testKubeClientset versioned.Interface, testkubeNamespace string, watchK8sResourceNamespaces []string, watchTestkubeAll bool, watchTestkubeCrNamespaces []string) *k8sInformers {
+
 	var k8sInformers k8sInformers
-	if len(watcherNamespaces) == 0 {
-		watcherNamespaces = append(watcherNamespaces, v1.NamespaceAll)
+	if len(watchK8sResourceNamespaces) == 0 {
+		watchK8sResourceNamespaces = append(watchK8sResourceNamespaces, v1.NamespaceAll)
 	}
 
-	for _, namespace := range watcherNamespaces {
+	for _, namespace := range watchK8sResourceNamespaces {
 		f := informers.NewSharedInformerFactoryWithOptions(clientset, 0, informers.WithNamespace(namespace))
 		k8sInformers.podInformers = append(k8sInformers.podInformers, f.Core().V1().Pods())
 		k8sInformers.deploymentInformers = append(k8sInformers.deploymentInformers, f.Apps().V1().Deployments())
@@ -64,14 +74,27 @@ func newK8sInformers(clientset kubernetes.Interface, testKubeClientset versioned
 		k8sInformers.ingressInformers = append(k8sInformers.ingressInformers, f.Networking().V1().Ingresses())
 		k8sInformers.clusterEventInformers = append(k8sInformers.clusterEventInformers, f.Core().V1().Events())
 		k8sInformers.configMapInformers = append(k8sInformers.configMapInformers, f.Core().V1().ConfigMaps())
+
 	}
 
-	testkubeInformerFactory := externalversions.NewSharedInformerFactoryWithOptions(
-		testKubeClientset, 0, externalversions.WithNamespace(testkubeNamespace))
-	k8sInformers.testTriggerInformer = testkubeInformerFactory.Tests().V1().TestTriggers()
-	k8sInformers.testSuiteInformer = testkubeInformerFactory.Tests().V3().TestSuites()
-	k8sInformers.testInformer = testkubeInformerFactory.Tests().V3().Tests()
+	if watchTestkubeAll == true {
+		watchTestkubeCrNamespaces = append(watchTestkubeCrNamespaces, v1.NamespaceAll)
+	} else {
+		if len(watchTestkubeCrNamespaces) == 0 {
+			watchTestkubeCrNamespaces = append(watchTestkubeCrNamespaces, testkubeNamespace)
+		}
+	}
 
+	for _, namespace := range watchTestkubeCrNamespaces {
+		var testkubeInformerFactory externalversions.SharedInformerFactory
+		testkubeInformerFactory = externalversions.NewSharedInformerFactoryWithOptions(
+			testKubeClientset, 0, externalversions.WithNamespace(namespace))
+		k8sInformers.testTriggerInformers = append(k8sInformers.testTriggerInformers, testkubeInformerFactory.Tests().V1().TestTriggers())
+		k8sInformers.testSuiteInformers = append(k8sInformers.testSuiteInformers, testkubeInformerFactory.Tests().V3().TestSuites())
+		k8sInformers.testInformers = append(k8sInformers.testInformers, testkubeInformerFactory.Tests().V3().Tests())
+	}
+	k8sInformers.triggerCRInformers = make(map[string]*InformersData)
+	k8sInformers.crInformers = make(map[string]*InformersData)
 	return &k8sInformers
 }
 
@@ -98,7 +121,7 @@ func (s *Service) runWatcher(ctx context.Context, leaseChan chan bool) {
 			} else {
 				if !running {
 					s.logger.Infof("trigger service: instance %s in cluster %s acquired lease", s.identifier, s.clusterID)
-					s.informers = newK8sInformers(s.clientset, s.testKubeClientset, s.testkubeNamespace, s.watcherNamespaces)
+					s.informers = newK8sInformers(s.clientset, s.testKubeClientset, s.testkubeNamespace, s.watcherNamespaces, s.watchTestkubeAll, s.watchTestkubeCRNamespaces)
 					stopChan = make(chan struct{})
 					s.runInformers(ctx, stopChan)
 					running = true
@@ -146,9 +169,15 @@ func (s *Service) runInformers(ctx context.Context, stop <-chan struct{}) {
 		s.informers.configMapInformers[i].Informer().AddEventHandler(s.configMapEventHandler(ctx))
 	}
 
-	s.informers.testTriggerInformer.Informer().AddEventHandler(s.testTriggerEventHandler(ctx, stop))
-	s.informers.testSuiteInformer.Informer().AddEventHandler(s.testSuiteEventHandler())
-	s.informers.testInformer.Informer().AddEventHandler(s.testEventHandler())
+	for i := range s.informers.testTriggerInformers {
+		s.informers.testTriggerInformers[i].Informer().AddEventHandler(s.testTriggerEventHandler(ctx, stop))
+	}
+	for i := range s.informers.testSuiteInformers {
+		s.informers.testSuiteInformers[i].Informer().AddEventHandler(s.testSuiteEventHandler())
+	}
+	for i := range s.informers.testInformers {
+		s.informers.testInformers[i].Informer().AddEventHandler(s.testEventHandler())
+	}
 
 	s.logger.Debugf("trigger service: starting pod informers")
 	for i := range s.informers.podInformers {
@@ -191,11 +220,17 @@ func (s *Service) runInformers(ctx context.Context, stop <-chan struct{}) {
 	}
 
 	s.logger.Debugf("trigger service: starting test trigger informer")
-	go s.informers.testTriggerInformer.Informer().Run(stop)
+	for i := range s.informers.testTriggerInformers {
+		go s.informers.testTriggerInformers[i].Informer().Run(stop)
+	}
 	s.logger.Debugf("trigger service: starting test suite informer")
-	go s.informers.testSuiteInformer.Informer().Run(stop)
+	for i := range s.informers.testSuiteInformers {
+		go s.informers.testSuiteInformers[i].Informer().Run(stop)
+	}
 	s.logger.Debugf("trigger service: starting test informer")
-	go s.informers.testInformer.Informer().Run(stop)
+	for i := range s.informers.testInformers {
+		go s.informers.testInformers[i].Informer().Run(stop)
+	}
 }
 
 func (s *Service) podEventHandler(ctx context.Context) cache.ResourceEventHandlerFuncs {
@@ -639,7 +674,17 @@ func (s *Service) testTriggerEventHandler(ctx context.Context, stop <-chan struc
 				customResourceInformer := df.ForResource(gvr)
 				customResourceInformer.Informer().AddEventHandler(s.customResourceEventHandler(ctx, gvr))
 				s.logger.Debugf("trigger service: starting custom resource informers")
-				go customResourceInformer.Informer().Run(stop)
+
+				stopCtx, cancel := context.WithCancel(context.Background())
+				go worker(cancel, stop, stopCtx.Done())
+
+				ifd := &InformersData{
+					informer: &customResourceInformer,
+					cancel:   cancel,
+				}
+				s.informers.triggerCRInformers[t.Name+t.Namespace] = ifd
+				s.informers.crInformers[gvr.String()+serializeSelector(t.Spec.ResourceSelector)] = ifd
+				go customResourceInformer.Informer().Run(stopCtx.Done())
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -668,7 +713,40 @@ func (s *Service) testTriggerEventHandler(ctx context.Context, stop <-chan struc
 				t.Namespace, t.Name, t.Spec.Resource, t.Spec.Event,
 			)
 			s.removeTrigger(t)
+			if ifd, found := s.informers.triggerCRInformers[t.Name+t.Namespace]; found {
+				if ifd.informer != nil && ifd.cancel != nil {
+					ifd.cancel()
+					ifd.informer = nil
+					delete(s.informers.triggerCRInformers, t.Name+t.Namespace)
+				}
+
+			}
 		},
+	}
+}
+
+// TODO: fix the formation
+func serializeSelector(selector testtriggersv1.TestTriggerSelector) string {
+	return selector.Name + selector.Namespace
+}
+
+func worker(cancel context.CancelFunc, stop <-chan struct{}, done <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			// Context is done, so we should stop the worker
+			fmt.Println("Work is stopped")
+			cancel()
+			return
+		case <-done:
+			// Context is done, so we should stop the worker
+			fmt.Println("Work is done")
+			return
+		default:
+			// Do some work
+			fmt.Println("Working...")
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
 
@@ -740,14 +818,14 @@ func (s *Service) customResourceEventHandler(ctx context.Context, gvr schema.Gro
 func (s *Service) testSuiteEventHandler() cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			testSuite, ok := obj.(*testsuitev3.TestSuite)
+			testSuite, ok := obj.(*testsuitev2.TestSuite)
 			if !ok {
 				s.logger.Errorf("failed to process create testsuite event due to it being an unexpected type, received type %+v", obj)
 				return
 			}
 			if inPast(testSuite.CreationTimestamp.Time, s.watchFromDate) {
 				s.logger.Debugf(
-					"trigger service: watcher component: no-op create test suite: test suite %s/%s was created in the past",
+					"trigger service: watcher component: no-op create trigger: testsuite %s/%s was created in the past",
 					testSuite.Namespace, testSuite.Name,
 				)
 				return
@@ -771,7 +849,7 @@ func (s *Service) testEventHandler() cache.ResourceEventHandlerFuncs {
 			}
 			if inPast(test.CreationTimestamp.Time, s.watchFromDate) {
 				s.logger.Debugf(
-					"trigger service: watcher component: no-op create test: test %s/%s was created in the past",
+					"trigger service: watcher component: no-op create trigger: test %s/%s was created in the past",
 					test.Namespace, test.Name,
 				)
 				return
